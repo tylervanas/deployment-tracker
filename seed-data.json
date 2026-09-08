@@ -1,0 +1,45 @@
+{
+  "groups": [
+    {
+      "name": "Regional",
+      "services": [
+        { "name": "AG Home SWA", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15654&environmentId=104796" },
+        { "name": "AG Administration SWA", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15653&environmentId=104781" },
+        { "name": "AG Administration Identity", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15647&environmentId=104734" },
+        { "name": "AG Administration Gateway", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15646&environmentId=104726" },
+        { "name": "AG Administration Access Management", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15645&environmentId=104718" },
+        { "name": "Config Function Home", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898625&view=results" },
+        { "name": "Config Function Admin", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898617&view=results" },
+        { "name": "Notifications API", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898582&view=results" },
+        { "name": "AG Administration API", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898611&view=results" },
+        { "name": "AG API", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898615&view=results" }
+      ]
+    },
+    {
+      "name": "Global Widget",
+      "services": [
+        { "name": "Widget", "pipelineUrl": "" }
+      ]
+    },
+    {
+      "name": "Global",
+      "services": [
+        { "name": "Internal Admin SWA", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15649&environmentId=104755" },
+        { "name": "MFE (Gateway, Identity)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15650&environmentId=104765" },
+        { "name": "MFE (Gateway, Identity)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_releaseProgress?_a=release-environment-logs&releaseId=15651&environmentId=104771" },
+        { "name": "Yarp API (NA)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898630&view=results" },
+        { "name": "Yarp API (EMEA)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898633&view=results" },
+        { "name": "Yarp API (APAC)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898635&view=results" },
+        { "name": "Config and Manifest Function (NA)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898640&view=results" },
+        { "name": "Config and Manifest Function (EMEA)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898642&view=results" },
+        { "name": "Config and Manifest Function (APAC)", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898643&view=results" },
+        { "name": "New Central Identity", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898648&view=results" },
+        { "name": "Welcome", "pipelineUrl": "" },
+        { "name": "Pathfinder", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898545&view=results" },
+        { "name": "Hello", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898546&view=results" },
+        { "name": "Proxy", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898547&view=results" },
+        { "name": "Sync", "pipelineUrl": "https://dev.azure.com/mrisoftware/MRI_Platform/_build/results?buildId=898548&view=results" }
+      ]
+    }
+  ]
+}

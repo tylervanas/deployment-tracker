@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Deployment Tracker</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="startup-overlay" class="mode-overlay">
+    <div class="mode-dialog loading-dialog">
+      <span class="spinner spinner-large" aria-hidden="true"></span>
+      <h2>Loading Deployment Tracker…</h2>
+      <p class="mode-intro">Fetching your services and settings from Azure DevOps.</p>
+    </div>
+  </div>
+
+  <div id="preview-overlay" class="mode-overlay" hidden>
+    <div class="mode-dialog">
+      <h2>Dry run — what will happen</h2>
+      <p class="mode-intro" id="preview-context"></p>
+      <div id="preview-body"></div>
+      <div class="wizard-actions">
+        <button id="preview-close-btn" class="btn btn-secondary">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="loading-overlay" class="mode-overlay" hidden>
+    <div class="mode-dialog loading-dialog">
+      <h2>Fetching the latest releases…</h2>
+      <p class="mode-intro">One moment while we check Azure DevOps for what is already built and deployed.</p>
+    </div>
+  </div>
+
+  <div id="start-overlay" class="mode-overlay" hidden>
+    <div class="mode-dialog">
+      <h2>Which deployment are you working on?</h2>
+      <p class="mode-intro">Carry on with an existing deployment, or start a fresh one.</p>
+      <div class="start-picker">
+        <label for="start-deployment">Continue an existing deployment</label>
+        <select id="start-deployment"></select>
+        <button id="start-continue-btn" class="btn btn-primary">Continue</button>
+      </div>
+      <div class="start-divider"><span>or</span></div>
+      <button id="start-new-btn" class="mode-card">
+        <span class="mode-card-title">Start a new deployment</span>
+        <span class="mode-card-text">Begin a fresh run and give it a name.</span>
+      </button>
+    </div>
+  </div>
+
+  <div id="mode-overlay" class="mode-overlay" hidden>
+    <div class="mode-dialog">
+      <h2>How would you like to work?</h2>
+      <p class="mode-intro">Pick a mode to get started. You can switch at any time.</p>
+      <div class="mode-choices">
+        <button id="mode-guided-btn" class="mode-card">
+          <span class="mode-card-title">Guided mode</span>
+          <span class="mode-card-text">Answer a few simple questions and we'll set everything up and queue it for you.</span>
+        </button>
+        <button id="mode-technical-btn" class="mode-card">
+          <span class="mode-card-title">Technical mode</span>
+          <span class="mode-card-text">Go straight to the full board with every pipeline, release and control.</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="wizard-overlay" class="mode-overlay" hidden>
+    <div class="mode-dialog wizard">
+      <div class="wizard-progress"><span id="wizard-step-label"></span></div>
+      <div id="wizard-body"></div>
+      <div class="wizard-actions">
+        <button id="wizard-back-btn" class="btn btn-secondary">Back</button>
+        <button id="wizard-next-btn" class="btn btn-primary">Next</button>
+        <button id="wizard-exit-btn" class="btn btn-ghost">Switch to technical mode</button>
+      </div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1>Deployment Tracker</h1>
+      <p class="subtitle">Stage it, track it, tell DevOps &amp; QA when it&rsquo;s good to go.</p>
+    </div>
+    <div class="topbar-right">
+      <label for="pat-input" title="Azure DevOps Personal Access Token (Build: Read scope is enough). Stored only in this browser, never sent anywhere except Azure DevOps.">
+        PAT token
+      </label>
+      <input id="pat-input" type="password" placeholder="Paste Azure DevOps PAT" autocomplete="off" />
+      <button id="save-token-btn" class="btn btn-secondary">Save</button>
+      <span id="token-state" class="token-state"></span>
+    </div>
+  </header>
+
+  <section class="deployment-bar" aria-label="Deployment history">
+    <div class="deployment-field">
+      <label for="deployment-name">Deployment</label>
+      <input id="deployment-name" type="text" placeholder="Deployment name" />
+      <button id="save-deployment-name-btn" class="btn btn-secondary">Save name</button>
+      <button id="new-deployment-btn" class="btn btn-primary">New</button>
+      <span id="deployment-save-state" class="deployment-save-state"></span>
+    </div>
+    <div class="history-field">
+      <label for="history-select">History</label>
+      <select id="history-select">
+        <option value="">Previous deployments...</option>
+      </select>
+    </div>
+  </section>
+
+  <section class="summary" id="summary"></section>
+
+  <section class="queue-toolbar" aria-label="Queue settings">
+    <label for="queue-lifecycle">Environment</label>
+    <select id="queue-lifecycle">
+      <option value="Dev">Dev</option>
+      <option value="QA">QA</option>
+      <option value="Release">Release</option>
+      <option value="Staging" selected>Staging</option>
+      <option value="Demo">Demo</option>
+      <option value="Production">Production</option>
+    </select>
+  </section>
+
+  <section class="toolbar">
+    <button id="refresh-all-btn" class="btn btn-primary">Refresh all</button>
+    <button id="copy-approval-links-btn" class="btn btn-secondary" disabled>Copy approval links (0)</button>
+    <label class="auto-refresh">
+      <input type="checkbox" id="auto-refresh-toggle" />
+      Auto-refresh every 15s
+    </label>
+    <button id="reset-all-btn" class="btn btn-secondary">Reset statuses</button>
+    <button id="clear-all-btn" class="btn btn-danger-outline">Clear all links</button>
+  </section>
+
+  <main id="groups"></main>
+
+  <section class="add-service">
+    <h2>Add a service</h2>
+    <form id="add-service-form">
+      <input id="new-group" list="group-options" aria-label="Group" placeholder="Group (e.g. AG)" required />
+      <datalist id="group-options"></datalist>
+      <input id="new-name" aria-label="Service name" placeholder="Service name" required />
+      <button type="submit" class="btn btn-secondary">Add</button>
+    </form>
+  </section>
+
+  <section class="bulk-import">
+    <div class="section-heading">
+      <div>
+        <h2>Bulk import run URLs</h2>
+        <p>Paste a release message, Markdown links, or a list of Azure DevOps URLs. Non-URL text is ignored.</p>
+      </div>
+    </div>
+    <form id="bulk-import-form">
+      <textarea id="bulk-import-text" rows="9" aria-label="Deployment message or URL list" placeholder="Paste the full deployment message or URL list here..." required></textarea>
+      <div id="bulk-import-review" class="bulk-import-review" aria-label="Imported deployment text with highlighted issues" hidden></div>
+      <div class="bulk-actions">
+        <button id="bulk-import-btn" type="submit" class="btn btn-primary">Match and import</button>
+        <button id="clean-run-btn" type="button" class="btn btn-danger-outline">Clean Run</button>
+        <button id="edit-import-btn" type="button" class="btn btn-secondary" hidden>Edit pasted text</button>
+        <span class="meta">A saved PAT is required; only Azure&rsquo;s pipeline name is used for placement.</span>
+      </div>
+    </form>
+    <div id="bulk-import-result" class="bulk-result" hidden></div>
+  </section>
+
+  <footer>
+    <p>
+      Paste an Azure DevOps Build run URL containing <code>buildId</code>, or a classic Release environment URL containing
+      <code>releaseId</code> and <code>environmentId</code>. The PAT needs Build (Read) and Release (Read) scopes.
+    </p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
