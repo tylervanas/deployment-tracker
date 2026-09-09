@@ -310,6 +310,13 @@ app.post('/api/services/:id/queue', async (req, res) => {
   const branch = resolveBranch(config, selectedBranch);
 
   try {
+    if (config.type !== 'package-release' &&
+        !(await branchExistsForConfig(config, branch, token, new Map()))) {
+      return res.status(400).json({
+        error: `Branch "${branch}" was not found in this repository. Nothing was queued.`
+      });
+    }
+
     if (config.type === 'package-release') {
       if (!packageVersion) return res.status(400).json({ error: 'Enter a package version.' });
       const packageMatch = await findPackageVersion({
@@ -1039,6 +1046,7 @@ async function deployOrCreateReleaseForBuild({ config, environmentIds, buildId, 
         project: config.project,
         releaseId: existing.releaseId,
         environmentId: environment.environmentId,
+        currentStatus: environment.status,
         token
       });
       environmentRuns.push({

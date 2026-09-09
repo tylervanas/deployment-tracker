@@ -533,6 +533,32 @@ test('redeploys an environment on an existing release', async () => {
   }
 });
 
+test('does not restart a stage a CD trigger already started', async () => {
+  const originalFetch = global.fetch;
+  const methods = [];
+  global.fetch = async (url, options = {}) => {
+    methods.push(options.method || 'GET');
+    return {
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({ name: 'DEV', status: 'inProgress' })
+    };
+  };
+  try {
+    const result = await deployExistingReleaseEnvironment({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      releaseId: 15648,
+      environmentId: 90003,
+      currentStatus: 'inProgress',
+      token: 'test-token'
+    });
+    assert.deepEqual(methods, ['GET'], 'must not PATCH an already-running stage (VS402964)');
+    assert.equal(result.status, 'running');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('queues a build with the selected branch and fixed parameters', async () => {
   const originalFetch = global.fetch;
   global.fetch = async (url, options) => {

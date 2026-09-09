@@ -1547,11 +1547,12 @@ const DEFAULT_BRANCHES = {
 const wizard = {
   index: 0,
   scopes: [],
-  lifecycle: 'Staging',
+  lifecycle: 'Dev',
   region: 'NA',
   branches: { Regional: '', Global: '' },
   newCode: { Regional: false, Global: false },
-  version: ''
+  version: '',
+  preview: null
 };
 
 function wizardApplicableSteps() {
@@ -1572,6 +1573,7 @@ function wizardApplicableSteps() {
     steps.push({ id: 'freshCode', scope });
   }
   steps.push({ id: 'summary' });
+  steps.push({ id: 'dryrun' });
   return steps;
 }
 
@@ -1598,7 +1600,11 @@ function renderWizard() {
   document.getElementById('wizard-step-label').textContent =
     `Step ${Math.min(wizard.index + 1, steps.length)} of ${steps.length}`;
   document.getElementById('wizard-back-btn').disabled = wizard.index === 0;
-  document.getElementById('wizard-next-btn').textContent = step.id === 'summary' ? 'Queue it' : 'Next';
+  // The dry-run table needs more room than the fixed-width question steps.
+  document.querySelector('#wizard-overlay .mode-dialog')
+    ?.classList.toggle('wizard-wide', step.id === 'dryrun');
+  document.getElementById('wizard-next-btn').textContent =
+    step.id === 'summary' ? 'Dry run' : step.id === 'dryrun' ? 'Queue it' : 'Next';
 
   const options = (name, values, current) => values.map((value) => {
     const label = typeof value === 'string' ? value : value.label;
@@ -1667,7 +1673,7 @@ function renderWizard() {
         { id: 'no', label: 'No, deploy what was already built and tested', hint: 'Recommended' },
         { id: 'yes', label: 'Yes, build the latest code first', hint: 'Runs a new pipeline, then creates new releases' }
       ], wizard.newCode[step.scope] ? 'yes' : 'no')}`;
-  } else {
+  } else if (step.id === 'summary') {
     const rows = SCOPE_ORDER.filter((scope) => wizard.scopes.includes(scope)).map((scope) => {
       if (scope === 'Global Widget') {
         return `<li><span>The Widget</span><strong>version ${escapeHtml(wizard.version || 'not set')}</strong></li>`;
@@ -1682,8 +1688,12 @@ function renderWizard() {
           ? `<li><span>Region</span><strong>${escapeHtml(wizard.region)}</strong></li>` : ''}
         ${rows}
       </ul>
-      <p class="wizard-help">Choosing <strong>Queue it</strong> will start ${wizard.scopes.length > 1
-        ? 'these deployments' : 'this deployment'} in Azure DevOps.</p>`;
+      <p class="wizard-help">Next we'll check exactly what would happen in Azure DevOps. Nothing is queued yet.</p>`;
+  } else {
+    body.innerHTML = `<h3>This is what will happen</h3>
+      <p class="wizard-help">Checked against Azure DevOps just now — <strong>nothing has been queued</strong>.
+        Choosing <strong>Queue it</strong> starts it for real.</p>
+      ${renderWizardPreview(wizard.preview)}`;
   }
 
   body.querySelectorAll('input[type="radio"]').forEach((input) => {
@@ -1706,12 +1716,51 @@ function renderWizard() {
   });
 }
 
+function renderWizardPreview(plans) {
+  if (!plans?.length) return '<p class="wizard-help">Nothing to queue for these choices.</p>';
+  return plans.map(({ scope, plan, error }) => {
+    if (error) {
+      return `<div class="wizard-preview-scope">
+        <h4>${escapeHtml(SCOPE_LABELS[scope] || scope)}</h4>
+        <p class="wizard-help">Could not check this: ${escapeHtml(error)}</p>
+      </div>`;
+    }
+    const gated = plan.steps.filter((item) => item.approval && !item.approval.unknown);
+    return `<div class="wizard-preview-scope">
+      <h4>${escapeHtml(SCOPE_LABELS[scope] || scope)}</h4>
+      ${gated.length
+        ? `<p class="preview-approval-note">${gated.length} deployment${gated.length > 1 ? 's' : ''} will pause for manual approval.</p>`
+        : ''}
+      <table class="preview-table">
+        <thead><tr><th>Service</th><th>Action</th><th>Details</th><th>Environment</th></tr></thead>
+        <tbody>${plan.steps.map((item) => `
+          <tr class="preview-${escapeHtml(item.action)}">
+            <td>${escapeHtml(item.service)}</td>
+            <td><span class="preview-tag preview-tag-${escapeHtml(item.action)}">${
+              escapeHtml(PREVIEW_LABEL[item.action] || item.action)}</span></td>
+            <td>${escapeHtml(item.detail || item.reason || '')}</td>
+            <td>${escapeHtml(item.environments || '')}</td>
+          </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+}
+
 function applyWizardSelections() {
   queueLifecycleSelect.value = wizard.lifecycle;
   queueSelections.regionalRegion = wizard.region;
   if (wizard.scopes.includes('Regional')) queueSelections.regionalBranch = wizard.branches.Regional;
   if (wizard.scopes.includes('Global')) queueSelections.globalBranch = wizard.branches.Global;
   if (wizard.scopes.includes('Global Widget')) queueSelections.widgetVersion = wizard.version;
+  // render() re-reads the toolbar inputs first, so push the answers there or they get clobbered.
+  const setInput = (id, value) => {
+    const el = document.getElementById(id);
+    if (el && value) el.value = value;
+  };
+  setInput('queue-regional-branch', queueSelections.regionalBranch);
+  setInput('queue-global-branch', queueSelections.globalBranch);
+  setInput('queue-regional-region', queueSelections.regionalRegion);
+  setInput('queue-widget-version', queueSelections.widgetVersion);
   for (const group of state.groups) {
     if (!wizard.scopes.includes(group.name) || group.name === 'Global Widget') continue;
     for (const block of pipelineBlocks(group).blocks) forceRebuild[block.key] = wizard.newCode[group.name];
@@ -1743,6 +1792,24 @@ async function advanceWizard() {
     wizard.branches[step.scope] = value;
   }
   if (step.id === 'summary') {
+    applyWizardSelections();
+    const overlay = document.getElementById('loading-overlay');
+    overlay.hidden = false;
+    try {
+      wizard.preview = await Promise.all(
+        SCOPE_ORDER.filter((item) => wizard.scopes.includes(item)).map(async (scope) => {
+          try {
+            return { scope, plan: await fetchPreview(scope) };
+          } catch (err) {
+            return { scope, error: err.message };
+          }
+        })
+      );
+    } finally {
+      overlay.hidden = true;
+    }
+  }
+  if (step.id === 'dryrun') {
     applyWizardSelections();
     exitWizard();
     for (const scope of SCOPE_ORDER.filter((item) => wizard.scopes.includes(item))) {
