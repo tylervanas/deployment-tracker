@@ -597,10 +597,21 @@ a { color: var(--blue); }
   font-size: 13px;
 }
 
-.pipeline-block-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.pipeline-block-title { display: flex; align-items: center; gap: 8px; font-weight: 600; flex-wrap: wrap; }
 .pipeline-block-actions { display: flex; align-items: center; gap: 12px; }
 .force-rebuild { display: flex; align-items: center; gap: 6px; font-weight: 400; }
 .pipeline-block .service-row { border-radius: 0; border-left: 0; border-right: 0; }
+
+.block-build-status { display: flex; align-items: center; gap: 8px; font-weight: 400; }
+.block-build-url {
+  width: 260px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  color: var(--text-muted, #9aa4b2);
+}
 
 .latest-release {
   display: flex;

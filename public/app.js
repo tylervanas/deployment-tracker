@@ -40,6 +40,12 @@ const queueSelections = {
 const refreshingIds = new Set();
 const latestReleases = {};
 const forceRebuild = {};
+// A mono-repo block shares ONE build across all its rows; these are the phases where a row's own
+// pipelineUrl still points at that shared build rather than its own release.
+const SHARED_BUILD_PHASES = ['build', 'creating-release', 'release-error'];
+function isAwaitingSharedBuild(svc, queueConfig) {
+  return queueConfig?.type === 'build-release' && SHARED_BUILD_PHASES.includes(svc.queueOperation?.phase);
+}
 let widgetVersions = [];
 const branchOptions = { Regional: [], Global: [] };
 
@@ -385,12 +391,24 @@ function renderGroups() {
   document.querySelectorAll('[data-action="force-rebuild"]').forEach((el) => {
     el.addEventListener('change', (e) => {
       forceRebuild[e.currentTarget.dataset.key] = e.currentTarget.checked;
+      render();
     });
+  });
+  document.querySelectorAll('[data-action="queue-block"]').forEach((el) => {
+    el.addEventListener('click', (e) =>
+      queueBlockPipeline(e.currentTarget.dataset.scope, e.currentTarget.dataset.key)
+    );
+  });
+  document.querySelectorAll('[data-action="check-block-build"]').forEach((el) => {
+    el.addEventListener('click', (e) =>
+      checkBlockBuild(e.currentTarget.dataset.scope, e.currentTarget.dataset.key)
+    );
   });
   document.getElementById('queue-regional-btn')?.addEventListener('click', () => queueScope('Regional'));
   document.getElementById('queue-regional-preview')?.addEventListener('click', () => previewScope('Regional'));
   document.getElementById('queue-global-preview')?.addEventListener('click', () => previewScope('Global'));
   document.getElementById('queue-global-btn')?.addEventListener('click', () => queueScope('Global'));
+  document.getElementById('queue-widget-preview')?.addEventListener('click', () => previewScope('Global Widget'));
   document.getElementById('queue-widget-btn')?.addEventListener('click', () => {
     const widget = state.groups.find((group) => group.name === 'Global Widget')?.services[0];
     if (widget) queueService(widget.id);
@@ -451,7 +469,9 @@ function renderLatestRelease(serviceId) {
   const last = release.lastDeployed;
   return `<div class="latest-release">
     <a href="${escapeHtml(release.webUrl || '#')}" target="_blank" rel="noopener">${escapeHtml(release.releaseName)}</a>
-    <span class="muted">build ${escapeHtml(String(release.buildNumber || '—'))}</span>
+    ${info.buildWebUrl
+      ? `<a class="muted" href="${escapeHtml(info.buildWebUrl)}" target="_blank" rel="noopener">build ${escapeHtml(String(release.buildNumber || '—'))}</a>`
+      : `<span class="muted">build ${escapeHtml(String(release.buildNumber || '—'))}</span>`}
     ${last ? `<span class="latest-env status-${escapeHtml(last.status)}">${escapeHtml(last.name)}</span>
       <span class="muted">${escapeHtml(formatWhen(last.deployedAt))}</span>` : '<span class="muted">not deployed yet</span>'}
   </div>`;
@@ -460,25 +480,55 @@ function renderLatestRelease(serviceId) {
 function renderGroupBody(group) {
   const { blocks, standalone } = pipelineBlocks(group);
   return `
-    ${blocks.map((block) => `
+    ${blocks.map((block) => {
+      const locked = forceRebuild[block.key] === true;
+      const tracked = block.services.find((svc) => SHARED_BUILD_PHASES.includes(svc.queueOperation?.phase));
+      return `
       <div class="pipeline-block">
         <div class="pipeline-block-header">
           <div class="pipeline-block-title">
             <a href="${escapeHtml(block.buildUrl)}" target="_blank" rel="noopener">${escapeHtml(block.name)}</a>
             <span class="muted">${block.services.length} services</span>
+            ${tracked ? renderBlockBuildStatus(group.name, block.key, tracked) : ''}
           </div>
           <div class="pipeline-block-actions">
             <label class="force-rebuild">
               <input type="checkbox" data-action="force-rebuild" data-key="${escapeHtml(block.key)}"
-                ${forceRebuild[block.key] ? 'checked' : ''} />
+                ${locked ? 'checked' : ''} />
               Force new build and release
             </label>
+            ${locked ? `<button class="btn btn-primary btn-small" data-action="queue-block"
+              data-key="${escapeHtml(block.key)}" data-scope="${escapeHtml(group.name)}">Queue pipeline</button>` : ''}
             <button class="btn btn-ghost" data-action="load-releases" data-key="${escapeHtml(block.key)}">Reload releases</button>
           </div>
         </div>
-        ${block.services.map((svc) => serviceRow(svc)).join('')}
-      </div>`).join('')}
+        ${block.services.map((svc) => serviceRow(svc, { blockLocked: locked })).join('')}
+      </div>`;
+    }).join('')}
     ${standalone.map((svc) => serviceRow(svc)).join('')}`;
+}
+
+// One shared build backs every row in the block while a "Force new build and release" run is in
+// flight — show its progress once, next to the block header, instead of duplicating it per row.
+function renderBlockBuildStatus(scope, key, svc) {
+  const operation = svc.queueOperation;
+  const failed = operation.phase === 'release-error';
+  const status = failed ? 'failed' : (operation.buildStatus || 'inProgress');
+  const label = failed
+    ? 'Release creation failed'
+    : operation.phase === 'creating-release'
+      ? 'Build succeeded — creating release…'
+      : (STATUS_LABEL[status] || status);
+  const checking = refreshingIds.has(String(svc.id));
+  return `
+    <span class="block-build-status">
+      <input type="url" class="block-build-url" readonly value="${escapeHtml(operation.buildWebUrl || '')}"
+        placeholder="Waiting for build to start…" />
+      <span class="status-badge status-${status}"><span class="dot"></span>${escapeHtml(label)}</span>
+      <button class="btn btn-secondary btn-small" data-action="check-block-build"
+        data-scope="${escapeHtml(scope)}" data-key="${escapeHtml(key)}" ${checking ? 'disabled' : ''}>
+        ${checking ? 'Checking…' : 'Check build status'}</button>
+    </span>`;
 }
 
 async function loadLatestReleases(serviceIds) {
@@ -503,7 +553,7 @@ async function loadLatestReleases(serviceIds) {
         method: 'POST',
         body: JSON.stringify({ token, branch })
       });
-      latestReleases[String(id)] = { release: result.release, branch: result.branch };
+      latestReleases[String(id)] = { release: result.release, branch: result.branch, buildWebUrl: result.buildWebUrl };
     } catch (err) {
       latestReleases[String(id)] = { error: err.message };
     }
@@ -544,6 +594,7 @@ function renderGroupQueueControls(groupName) {
     return `
       <label for="queue-widget-version">Package version</label>
       <select id="queue-widget-version"></select>
+      <button id="queue-widget-preview" class="btn btn-secondary">Dry run</button>
       <button id="queue-widget-btn" class="btn btn-primary">Queue Widget</button>`;
   }
   if (groupName === 'Global') {
@@ -568,19 +619,21 @@ function servicePipelineUrl(config) {
   return null;
 }
 
-function serviceRow(svc) {
+function serviceRow(svc, { blockLocked = false } = {}) {
   const isRefreshing = refreshingIds.has(String(svc.id));
   const queueConfig = state.queueConfigs?.[String(svc.id)];
-  const pipelineName = svc.pipelineName
-    ? `<span class="pipeline-name" title="${escapeHtml(svc.pipelineName)}">[${escapeHtml(svc.pipelineName)}]</span>`
+  // The shared mono-repo build isn't this row's pipeline, so don't name-check the row against it.
+  const shownPipelineName = isAwaitingSharedBuild(svc, queueConfig) ? null : svc.pipelineName;
+  const pipelineName = shownPipelineName
+    ? `<span class="pipeline-name" title="${escapeHtml(shownPipelineName)}">[${escapeHtml(shownPipelineName)}]</span>`
     : '';
   const pipelineNameApproved = (svc.acceptedPipelineNames || []).some(
-    (name) => normalizeName(name) === normalizeName(svc.pipelineName)
+    (name) => normalizeName(name) === normalizeName(shownPipelineName)
   );
-  const nameCheck = svc.pipelineName
+  const nameCheck = shownPipelineName
     ? pipelineNameApproved
       ? '<div class="name-check name-match">Name approved</div>'
-      : namesMatch(svc.name, svc.pipelineName)
+      : namesMatch(svc.name, shownPipelineName)
         ? '<div class="name-check name-match">Name matches</div>'
         : `<div class="name-check name-mismatch">
             <span>Name mismatch: expected “${escapeHtml(svc.name)}”</span>
@@ -601,7 +654,11 @@ function serviceRow(svc) {
         </div>
         ${nameCheck}
       </div>
-      <input type="url" placeholder="Paste build or release run URL..." value="${escapeHtml(svc.pipelineUrl || '')}"
+      <input type="url" placeholder="${isAwaitingSharedBuild(svc, queueConfig)
+          ? 'Waiting for the shared build pipeline to finish…'
+          : 'Paste build or release run URL...'}"
+        value="${isAwaitingSharedBuild(svc, queueConfig) ? '' : escapeHtml(svc.pipelineUrl || '')}"
+        ${isAwaitingSharedBuild(svc, queueConfig) ? 'disabled' : ''}
         data-action="save-url" data-id="${svc.id}" />
       <div>
         ${renderRunLines(svc, queueConfig)}
@@ -609,8 +666,10 @@ function serviceRow(svc) {
       <button class="btn btn-secondary btn-small refresh-btn" data-action="refresh" data-id="${svc.id}"
         ${isRefreshing ? 'disabled' : ''}>${refreshContent}</button>
       <div class="row-actions">
-        <button class="btn btn-primary btn-small" data-action="queue" data-id="${svc.id}"
-          ${queueConfig ? '' : 'disabled'} title="${queueConfig ? 'Queue this pipeline with the selected deployment settings' : 'Queue configuration has not been set up yet'}">${svc.pipelineUrl ? 'Rerun' : 'Queue pipeline'}</button>
+        ${queueConfig?.type === 'package-release' ? '' : `<button class="btn btn-primary btn-small" data-action="queue" data-id="${svc.id}"
+          ${queueConfig && !blockLocked ? '' : 'disabled'} title="${blockLocked
+            ? 'Force new build and release is on for this pipeline — use the block\'s Queue pipeline button instead'
+            : queueConfig ? 'Queue this pipeline with the selected deployment settings' : 'Queue configuration has not been set up yet'}">${svc.pipelineUrl ? 'Rerun' : 'Queue pipeline'}</button>`}
         <button class="btn btn-secondary btn-small" data-action="rename" data-id="${svc.id}">Rename</button>
         <button class="btn btn-danger-outline btn-small" data-action="delete" data-id="${svc.id}">Remove</button>
       </div>
@@ -625,10 +684,18 @@ function renderRunLines(svc, queueConfig) {
       number: svc.runNumber,
       webUrl: operation?.releaseWebUrl || svc.webUrl,
       message: operation?.releaseMessage || svc.message
+    } : operation?.phase === 'release-error' ? {
+      status: 'failed',
+      message: svc.message || 'Release creation failed. Refresh to retry.'
     } : null;
+    const emptyMessage = operation?.phase === 'creating-release'
+      ? 'Build succeeded — creating release…'
+      : operation?.phase === 'build'
+        ? 'Waiting for build pipeline to complete.'
+        : 'Not queued.';
     return `
       ${renderLatestRelease(svc.id)}
-      ${renderRunLine('Release', releaseRun, operation?.phase === 'build' ? 'Waiting for pipeline.' : 'Not queued.')}`;
+      ${renderRunLine('Release', releaseRun, emptyMessage)}`;
   }
   return renderRunLine(svc.runType === 'release' ? 'Release Pipeline' : 'Pipeline', {
     status: svc.status,
@@ -779,6 +846,52 @@ async function queueService(id, { skipConfirmation = false } = {}) {
     });
   } finally {
     refreshingIds.delete(String(id));
+    await loadState();
+  }
+}
+
+// Queues the shared mono-repo build exactly once, then patches every SWA in the block with it —
+// preventing the row-level Queue pipeline buttons from each triggering their own build.
+async function queueBlockPipeline(scope, key) {
+  const services = (state.groups.find((group) => group.name === scope)?.services || [])
+    .filter((service) => String(state.queueConfigs?.[String(service.id)]?.buildDefinitionId) === key);
+  const config = state.queueConfigs?.[String(services[0]?.id)];
+  if (!services.length || !config) return;
+
+  let selected;
+  try {
+    selected = selectedQueueValues(config, scope);
+  } catch (err) {
+    alert(err.message);
+    return;
+  }
+  if (!confirm(
+    `Queue a new build for ${config.monoRepoName || config.buildDefinitionName}?\n\n` +
+    `Branch: ${selected.branch}\n` +
+    `Environment: ${selected.lifecycle}${selected.region ? `\nRegion: ${selected.region}` : ''}\n\n` +
+    `This queues ONE build and applies it to:\n` +
+    services.map((service) => `• ${service.name}`).join('\n')
+  )) return;
+
+  services.forEach((service) => refreshingIds.add(String(service.id)));
+  render();
+  try {
+    await api('/pipeline-blocks/queue', {
+      method: 'POST',
+      body: JSON.stringify({
+        token: getToken(),
+        scope,
+        key,
+        branch: selected.branch,
+        lifecycle: selected.lifecycle,
+        region: selected.region
+      })
+    });
+    forceRebuild[key] = false;
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    services.forEach((service) => refreshingIds.delete(String(service.id)));
     await loadState();
   }
 }
@@ -946,8 +1059,10 @@ async function refreshService(id) {
     return;
   }
   const service = allServices().find((item) => String(item.id) === String(id));
-  // Nothing has been queued yet, so show the current release instead of erroring.
-  if (!service?.pipelineUrl && state.queueConfigs?.[String(id)]?.type === 'build-release') {
+  // Nothing has been queued yet, so show the current release instead of erroring. A row waiting on
+  // its block's shared build has no URL of its own but does have a build to poll.
+  if (!service?.pipelineUrl && !service?.queueOperation &&
+      state.queueConfigs?.[String(id)]?.type === 'build-release') {
     await loadLatestReleases([id]);
     return;
   }
@@ -960,6 +1075,32 @@ async function refreshService(id) {
     });
   } finally {
     refreshingIds.delete(String(id));
+    await loadState();
+  }
+}
+
+// One click checks the shared build for every row in the block, instead of clicking Refresh 3+
+// times separately — each row still resolves its own release independently once the build is done.
+async function checkBlockBuild(scope, key) {
+  const token = getToken();
+  if (!token) {
+    alert('Paste and save your Azure DevOps personal access token first.');
+    return;
+  }
+  const services = (state.groups.find((group) => group.name === scope)?.services || [])
+    .filter((service) =>
+      String(state.queueConfigs?.[String(service.id)]?.buildDefinitionId) === key &&
+      SHARED_BUILD_PHASES.includes(service.queueOperation?.phase));
+  if (!services.length) return;
+
+  services.forEach((service) => refreshingIds.add(String(service.id)));
+  render();
+  try {
+    await Promise.allSettled(services.map((service) =>
+      api(`/services/${service.id}/refresh`, { method: 'POST', body: JSON.stringify({ token }) })
+    ));
+  } finally {
+    services.forEach((service) => refreshingIds.delete(String(service.id)));
     await loadState();
   }
 }
@@ -996,7 +1137,7 @@ async function refreshAll({ background = false } = {}) {
     if (!background) alert('Paste and save your Azure DevOps personal access token first.');
     return;
   }
-  const targets = allServices().filter((s) => s.pipelineUrl);
+  const targets = allServices().filter((s) => s.pipelineUrl || s.queueOperation?.buildWebUrl);
   refreshAllInProgress = true;
   for (const svc of targets) refreshingIds.add(String(svc.id));
   refreshAllBtn.disabled = true;

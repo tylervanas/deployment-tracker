@@ -7,6 +7,8 @@ const {
   fetchRepositoryBranches,
   fetchRecentBuildConfigurations,
   findLatestReleaseForBranch,
+  findReleaseForPackageVersion,
+  findReleaseForBuildId,
   extractEnvironmentMap,
   deployExistingReleaseEnvironment,
   queueBuild,
@@ -281,6 +283,229 @@ test('finds the newest release built from the selected branch', async () => {
   }
 });
 
+test('picks the Build artifact by alias, not the GitHub source artifact, for the build number', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url.includes('/releases?')) {
+      return {
+        ok: true, status: 200, statusText: 'OK',
+        json: async () => ({ value: [
+          { id: 15647, artifacts: [{ definitionReference: { branch: { name: 'refs/heads/release/release-ag-2026.03' } } }] }
+        ] })
+      };
+    }
+    assert.match(url, /_apis\/release\/releases\/15647/);
+    return {
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({
+        id: 15647,
+        name: 'Release-115',
+        releaseDefinition: { id: 66, name: 'agora_admin_MFE_Identity' },
+        artifacts: [
+          {
+            alias: '_MRI-Software_MRI.Agora.Adminstration',
+            type: 'GitHub',
+            definitionReference: { branch: { name: 'develop' }, version: { id: '1d03b94ec4a6508b27e6358f0388096e22bde389', name: '1d03b94ec' } }
+          },
+          {
+            alias: '_MRI-Software.MRI.Agora.Adminstration-mono-repo',
+            type: 'Build',
+            definitionReference: { branch: { name: 'refs/heads/release/release-ag-2026.03' }, version: { id: '898558', name: '20260907.1' } }
+          }
+        ],
+        environments: []
+      })
+    };
+  };
+
+  try {
+    const release = await findLatestReleaseForBranch({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      releaseDefinitionId: 66,
+      artifactAlias: '_MRI-Software.MRI.Agora.Adminstration-mono-repo',
+      sourceBranch: 'release/release-ag-2026.03',
+      token: 'test-token'
+    });
+    assert.equal(release.buildId, '898558', 'must use the Build artifact id, not the git commit sha');
+    assert.equal(release.buildNumber, '20260907.1');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('finds an existing release for a package version, matching by artifact alias', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url.includes('/releases?')) {
+      return {
+        ok: true, status: 200, statusText: 'OK',
+        json: async () => ({ value: [
+          {
+            id: 15557,
+            artifacts: [
+              { alias: '_source', definitionReference: { branch: { name: 'develop' } } },
+              { alias: 'ag-widget', definitionReference: { version: { name: '6.1.4' } } }
+            ]
+          },
+          {
+            id: 15587,
+            artifacts: [
+              { alias: '_source', definitionReference: { version: { name: '2762e4c4e' } } },
+              { alias: 'ag-widget', definitionReference: { version: { name: '6.1.5' } } }
+            ]
+          }
+        ] })
+      };
+    }
+    assert.match(url, /_apis\/release\/releases\/15587/);
+    return {
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({
+        id: 15587,
+        name: 'Release-64',
+        releaseDefinition: { id: 55, name: 'MRI-platform-AG-widget' },
+        artifacts: [
+          { alias: '_source', definitionReference: { version: { name: '2762e4c4e' } } },
+          { alias: 'ag-widget', definitionReference: { version: { name: '6.1.5' } } }
+        ],
+        environments: [
+          { id: 5001, definitionEnvironmentId: 397, name: 'dev', status: 'succeeded', deploySteps: [] }
+        ]
+      })
+    };
+  };
+
+  try {
+    const release = await findReleaseForPackageVersion({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      releaseDefinitionId: 55,
+      artifactAlias: 'ag-widget',
+      packageVersion: '6.1.5',
+      token: 'test-token'
+    });
+    assert.equal(release.releaseId, 15587);
+    assert.equal(release.packageVersion, '6.1.5', 'must read the package artifact, not the first artifact');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('returns null when no release matches the requested package version', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true, status: 200, statusText: 'OK',
+    json: async () => ({ value: [
+      { id: 1, artifacts: [{ alias: 'ag-widget', definitionReference: { version: { name: '6.1.0' } } }] }
+    ] })
+  });
+  try {
+    const release = await findReleaseForPackageVersion({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      releaseDefinitionId: 55,
+      artifactAlias: 'ag-widget',
+      packageVersion: '9.9.9',
+      token: 'test-token'
+    });
+    assert.equal(release, null);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('finds a release Azure already auto-created for a specific build id', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (url.includes('/releases?')) {
+      return {
+        ok: true, status: 200, statusText: 'OK',
+        json: async () => ({ value: [
+          { id: 1, artifacts: [{ alias: '_build', definitionReference: { version: { id: '898000' } } }] },
+          { id: 2, artifacts: [{ alias: '_build', definitionReference: { version: { id: '899240' } } }] }
+        ] })
+      };
+    }
+    assert.match(url, /_apis\/release\/releases\/2/);
+    return {
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({
+        id: 2,
+        name: 'Release-796',
+        releaseDefinition: { id: 48, name: 'AG-HOME' },
+        artifacts: [{ alias: '_build', definitionReference: { version: { id: '899240', name: '20260909.1' } } }],
+        environments: [
+          { id: 6001, definitionEnvironmentId: 330, name: 'DEV', status: 'notStarted', deploySteps: [] }
+        ]
+      })
+    };
+  };
+
+  try {
+    const release = await findReleaseForBuildId({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      releaseDefinitionId: 48,
+      artifactAlias: '_build',
+      buildId: 899240,
+      token: 'test-token'
+    });
+    assert.equal(release.releaseId, 2);
+    assert.equal(release.releaseName, 'Release-796');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('returns null when no release was created for that build id yet', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true, status: 200, statusText: 'OK',
+    json: async () => ({ value: [
+      { id: 1, artifacts: [{ alias: '_build', definitionReference: { version: { id: '111' } } }] }
+    ] })
+  });
+  try {
+    const release = await findReleaseForBuildId({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      releaseDefinitionId: 48,
+      artifactAlias: '_build',
+      buildId: 999,
+      token: 'test-token'
+    });
+    assert.equal(release, null);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('surfaces the real Azure error message instead of a bare status code', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: false, status: 400, statusText: 'Bad Request',
+    json: async () => ({ message: 'VS402721: The release could not be created because...' })
+  });
+  try {
+    await assert.rejects(
+      () => findLatestReleaseForBranch({
+        organization: 'mrisoftware',
+        project: 'MRI_Platform',
+        releaseDefinitionId: 59,
+        sourceBranch: 'develop',
+        token: 'test-token'
+      }),
+      (err) => {
+        assert.match(err.message, /VS402721/);
+        return true;
+      }
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('redeploys an environment on an existing release', async () => {
   const originalFetch = global.fetch;
   let seen = {};
@@ -350,7 +575,14 @@ test('queues a build with the selected branch and fixed parameters', async () =>
 test('creates a release and starts the selected environment', async () => {
   const originalFetch = global.fetch;
   const requests = [];
-  global.fetch = async (url, options) => {
+  global.fetch = async (url, options = {}) => {
+    if (!options.method || options.method === 'GET') {
+      assert.match(url, /_apis\/release\/definitions\/48/);
+      return {
+        ok: true, status: 200, statusText: 'OK',
+        json: async () => ({ id: 48, name: 'AG-HOME', environments: [{ id: 410, name: 'Staging' }] })
+      };
+    }
     requests.push({ url, method: options.method, body: JSON.parse(options.body) });
     const body = options.method === 'POST'
       ? {
@@ -378,10 +610,35 @@ test('creates a release and starts the selected environment', async () => {
     });
     assert.equal(requests.length, 2);
     assert.equal(requests[0].body.definitionId, 48);
-    assert.deepEqual(requests[0].body.manualEnvironments, [410]);
+    assert.deepEqual(requests[0].body.manualEnvironments, ['Staging'], 'must send stage names, not ids');
     assert.equal(requests[1].body.status, 'inProgress');
     assert.equal(result.status, 'running');
     assert.match(result.webUrl, /releaseId=16000&environmentId=11000/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('fails clearly when a requested stage is not part of the release definition', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true, status: 200, statusText: 'OK',
+    json: async () => ({ id: 59, name: 'Agora-Admin-SWA', environments: [{ id: 436, name: 'DEV' }] })
+  });
+  try {
+    await assert.rejects(
+      createReleaseAndDeploy({
+        organization: 'mrisoftware',
+        project: 'MRI_Platform',
+        releaseDefinitionId: 59,
+        artifactAlias: '_mono-repo',
+        environmentDefinitionIds: [439],
+        buildId: 901311,
+        buildNumber: '20260909.2',
+        token: 'test-token'
+      }),
+      /Stage 439 is not part of release definition "Agora-Admin-SWA"/
+    );
   } finally {
     global.fetch = originalFetch;
   }

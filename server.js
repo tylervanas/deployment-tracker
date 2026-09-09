@@ -10,6 +10,8 @@ const {
   fetchRecentBuildConfigurations,
   fetchReleaseSummary,
   findLatestReleaseForBranch,
+  findReleaseForPackageVersion,
+  findReleaseForBuildId,
   fetchReleaseApprovalGates,
   fetchBuildApprovalHistory,
   fetchCurrentBuildApprovers,
@@ -264,6 +266,7 @@ app.post('/api/services/:id/latest-release', async (req, res) => {
       organization: config.organization,
       project: config.project,
       releaseDefinitionId: config.releaseDefinitionId,
+      artifactAlias: config.artifactAlias,
       sourceBranch: branch,
       token
     });
@@ -323,15 +326,16 @@ app.post('/api/services/:id/queue', async (req, res) => {
           error: `${config.packageName} version ${packageVersion} was not found. Nothing was deployed.`
         });
       }
-      const release = await createPackageReleaseAndDeploy({
-        organization: config.organization,
-        project: config.project,
-        releaseDefinitionId: config.releaseDefinitionId,
-        artifactAlias: config.artifactAlias,
-        environmentDefinitionIds: target.environmentIds,
-        packageVersion: packageMatch.version,
-        token
-      });
+      const release = await deployExistingPackageRelease({ config, target, packageVersion: packageMatch.version, token })
+        || await createPackageReleaseAndDeploy({
+          organization: config.organization,
+          project: config.project,
+          releaseDefinitionId: config.releaseDefinitionId,
+          artifactAlias: config.artifactAlias,
+          environmentDefinitionIds: target.environmentIds,
+          packageVersion: packageMatch.version,
+          token
+        });
       const updated = store.updateService(
         svc.id,
         packageReleasePatch(release, config, packageMatch),
@@ -469,20 +473,39 @@ app.post('/api/preview', async (req, res) => {
           version: requested,
           token
         });
-        return match
+        if (!match) {
+          return {
+            service: service.name,
+            action: 'blocked',
+            pipelineUrl: releaseUrl,
+            reason: `${config.packageName} version ${requested || '(none selected)'} was not found.`
+          };
+        }
+        const existingRelease = await findReleaseForPackageVersion({
+          organization: config.organization,
+          project: config.project,
+          releaseDefinitionId: config.releaseDefinitionId,
+          artifactAlias: config.artifactAlias,
+          packageVersion: match.version,
+          token
+        }).catch(() => null);
+        return existingRelease
           ? {
+              service: service.name,
+              action: 'redeploy-release',
+              detail: `Redeploy existing ${existingRelease.releaseName} (${config.packageName} ${match.version})`,
+              environments,
+              webUrl: existingRelease.webUrl,
+              pipelineUrl: releaseUrl,
+              approval: await approvalFor()
+            }
+          : {
               service: service.name,
               action: 'create-package-release',
               detail: `Create a new ${config.releaseDefinitionName} release from ${config.packageName} ${match.version}`,
               environments,
               pipelineUrl: releaseUrl,
               approval: await approvalFor()
-            }
-          : {
-              service: service.name,
-              action: 'blocked',
-              pipelineUrl: releaseUrl,
-              reason: `${config.packageName} version ${requested || '(none selected)'} was not found.`
             };
       }
 
@@ -504,6 +527,7 @@ app.post('/api/preview', async (req, res) => {
           organization: config.organization,
           project: config.project,
           releaseDefinitionId: config.releaseDefinitionId,
+          artifactAlias: config.artifactAlias,
           sourceBranch: branch,
           token
         });
@@ -668,7 +692,12 @@ app.post('/api/queue-all', async (req, res) => {
   const queuedServices = [];
   try {
     for (const plan of applicablePlans.filter((item) => item.config.type === 'package-release')) {
-      const release = await createPackageReleaseAndDeploy({
+      const release = await deployExistingPackageRelease({
+        config: plan.config,
+        target: plan.target,
+        packageVersion: plan.packageMatch.version,
+        token
+      }) || await createPackageReleaseAndDeploy({
         organization: plan.config.organization,
         project: plan.config.project,
         releaseDefinitionId: plan.config.releaseDefinitionId,
@@ -742,6 +771,69 @@ app.post('/api/queue-all', async (req, res) => {
   }
 });
 
+// Queues a shared mono-repo build exactly once and patches every SWA fed by it with the same
+// build, so per-row Queue pipeline clicks can never trigger duplicate builds on that pipeline.
+app.post('/api/pipeline-blocks/queue', async (req, res) => {
+  const currentState = store.getState();
+  const deploymentId = currentState.deployment.id;
+  const token = req.body?.token || '';
+  const scope = req.body?.scope;
+  const key = String(req.body?.key || '');
+  const lifecycle = req.body?.lifecycle;
+  const region = req.body?.region;
+  const selectedBranch = (req.body?.branch || '').trim();
+  if (!token) return res.status(400).json({ error: 'Azure DevOps PAT is required.' });
+  if (!selectedBranch) return res.status(400).json({ error: 'Select a branch.' });
+
+  const services = currentState.groups.find((group) => group.name === scope)?.services || [];
+  const plans = services
+    .map((service) => ({ service, config: store.getQueueConfig(service.id) }))
+    .filter((plan) => plan.config?.type === 'build-release' && String(plan.config.buildDefinitionId) === key);
+  if (!plans.length) return res.status(400).json({ error: 'No services found for this pipeline.' });
+
+  const branch = resolveBranch(plans[0].config, selectedBranch);
+  const branchCache = new Map();
+  if (!(await branchExistsForConfig(plans[0].config, branch, token, branchCache))) {
+    return res.status(400).json({ error: `Branch "${branch}" was not found in this repository.` });
+  }
+
+  const applicablePlans = [];
+  for (const plan of plans) {
+    const target = resolveQueueTarget(plan.config, lifecycle, region, scope);
+    if (!target || target.applicable === false) continue;
+    plan.target = target;
+    applicablePlans.push(plan);
+  }
+  if (!applicablePlans.length) {
+    return res.status(400).json({
+      error: `No service on this pipeline has a mapping for ${lifecycle}${region ? ` / ${region}` : ''}.`
+    });
+  }
+
+  try {
+    const first = applicablePlans[0];
+    const queued = await queueBuild({
+      organization: first.config.organization,
+      project: first.config.project,
+      definitionId: first.config.buildDefinitionId,
+      sourceBranch: branch,
+      parameters: first.target.parameters,
+      templateParameters: first.target.templateParameters,
+      token
+    });
+    for (const plan of applicablePlans) {
+      store.updateService(plan.service.id, buildQueuePatch(queued, plan.config, plan.target), deploymentId);
+    }
+    res.json({
+      buildId: queued.buildId,
+      queuedServiceIds: applicablePlans.map((plan) => plan.service.id),
+      state: store.getState()
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 function packageReleasePatch(release, config, packageMatch) {
   return {
     pipelineUrl: release.webUrl,
@@ -766,13 +858,16 @@ function packageReleasePatch(release, config, packageMatch) {
 }
 
 function buildQueuePatch(queued, config, target) {
+  // A build-release row's own URL is its release; the shared build lives on the block instead, so
+  // leaving it off the row avoids showing the mono-repo build's name as a pipeline-name mismatch.
+  const ownsBuildUrl = config.type !== 'build-release';
   return {
-    pipelineUrl: queued.webUrl,
-    runType: 'build',
-    pipelineName: queued.pipelineName || config.buildDefinitionName,
-    runNumber: queued.buildNumber,
-    status: queued.status,
-    message: queued.message,
+    pipelineUrl: ownsBuildUrl ? queued.webUrl : '',
+    runType: ownsBuildUrl ? 'build' : null,
+    pipelineName: ownsBuildUrl ? (queued.pipelineName || config.buildDefinitionName) : null,
+    runNumber: ownsBuildUrl ? queued.buildNumber : null,
+    status: ownsBuildUrl ? queued.status : 'idle',
+    message: ownsBuildUrl ? queued.message : null,
     lastChecked: new Date().toISOString(),
     queueOperation: {
       phase: 'build',
@@ -796,21 +891,25 @@ function buildQueuePatch(queued, config, target) {
 
 function latestReleasePatch(release, runs, config, target) {
   const aggregate = aggregateReleaseRuns(runs);
+  // release.webUrl is a release-summary link with no environmentId, which refresh polling can't
+  // parse — use the first environment's own progress URL instead so status keeps updating.
+  const primaryUrl = runs[0]?.webUrl || release.webUrl;
   return {
-    pipelineUrl: release.webUrl,
+    pipelineUrl: primaryUrl,
     runType: 'release',
     pipelineName: config.releaseDefinitionName,
     runNumber: release.releaseName,
     status: aggregate.status,
     message: aggregate.message,
-    webUrl: release.webUrl,
+    webUrl: primaryUrl,
     lastChecked: new Date().toISOString(),
     queueOperation: {
       phase: 'release',
       reusedRelease: true,
       releaseId: release.releaseId,
-      releaseWebUrl: release.webUrl,
+      releaseWebUrl: primaryUrl,
       releaseStatus: aggregate.status,
+      releaseMessage: aggregate.message,
       releaseEnvironments: runs,
       buildId: release.buildId,
       buildNumber: release.buildNumber,
@@ -831,6 +930,7 @@ async function deployLatestRelease({ config, target, branch, token }) {
     organization: config.organization,
     project: config.project,
     releaseDefinitionId: config.releaseDefinitionId,
+    artifactAlias: config.artifactAlias,
     sourceBranch: branch,
     token
   });
@@ -860,10 +960,123 @@ async function deployLatestRelease({ config, target, branch, token }) {
       environmentName: environment.name,
       status: result.status,
       message: result.message,
-      webUrl: release.webUrl
+      webUrl: `https://dev.azure.com/${config.organization}/${config.project}/_releaseProgress?_a=release-environment-logs&releaseId=${release.releaseId}&environmentId=${environment.environmentId}`
     });
   }
   return { patch: latestReleasePatch(release, runs, config, target), release };
+}
+
+// Same idea as deployLatestRelease, but keyed on package version instead of branch — reuse the
+// release already created for this exact version rather than always creating a new one.
+async function deployExistingPackageRelease({ config, target, packageVersion, token }) {
+  const release = await findReleaseForPackageVersion({
+    organization: config.organization,
+    project: config.project,
+    releaseDefinitionId: config.releaseDefinitionId,
+    artifactAlias: config.artifactAlias,
+    packageVersion,
+    token
+  });
+  if (!release) return null;
+
+  const environmentRuns = [];
+  for (const definitionEnvironmentId of target.environmentIds) {
+    const environment = release.environments.find(
+      (item) => item.definitionEnvironmentId === definitionEnvironmentId
+    );
+    if (!environment) {
+      throw new Error(`Release ${release.releaseName} has no environment matching ${target.targetValue}.`);
+    }
+    const result = await deployExistingReleaseEnvironment({
+      organization: config.organization,
+      project: config.project,
+      releaseId: release.releaseId,
+      environmentId: environment.environmentId,
+      token
+    });
+    environmentRuns.push({
+      environmentId: environment.environmentId,
+      environmentName: environment.name,
+      status: result.status,
+      message: result.message,
+      webUrl: `https://dev.azure.com/${config.organization}/${config.project}/_releaseProgress?_a=release-environment-logs&releaseId=${release.releaseId}&environmentId=${environment.environmentId}`
+    });
+  }
+  const aggregate = aggregateReleaseRuns(environmentRuns);
+  return {
+    ...aggregate,
+    releaseId: release.releaseId,
+    environmentId: environmentRuns[0]?.environmentId,
+    runNumber: release.releaseName,
+    pipelineName: release.releaseDefinitionName || config.releaseDefinitionName,
+    webUrl: environmentRuns[0]?.webUrl,
+    environmentRuns,
+    reusedRelease: true
+  };
+}
+
+// After a shared build succeeds: some release definitions have a CD trigger that already spawned
+// a release from this exact build, so deploy to that instead of creating a duplicate release.
+async function deployOrCreateReleaseForBuild({ config, environmentIds, buildId, buildNumber, sourceBranch, sourceVersion, token }) {
+  const existing = await findReleaseForBuildId({
+    organization: config.organization,
+    project: config.project,
+    releaseDefinitionId: config.releaseDefinitionId,
+    artifactAlias: config.artifactAlias,
+    buildId,
+    token
+  }).catch(() => null);
+
+  if (existing) {
+    const environmentRuns = [];
+    for (const definitionEnvironmentId of environmentIds) {
+      const environment = existing.environments.find(
+        (item) => item.definitionEnvironmentId === definitionEnvironmentId
+      );
+      if (!environment) break;
+      const result = await deployExistingReleaseEnvironment({
+        organization: config.organization,
+        project: config.project,
+        releaseId: existing.releaseId,
+        environmentId: environment.environmentId,
+        token
+      });
+      environmentRuns.push({
+        environmentId: environment.environmentId,
+        environmentName: environment.name,
+        status: result.status,
+        message: result.message,
+        webUrl: `https://dev.azure.com/${config.organization}/${config.project}/_releaseProgress?_a=release-environment-logs&releaseId=${existing.releaseId}&environmentId=${environment.environmentId}`
+      });
+    }
+    if (environmentRuns.length === environmentIds.length) {
+      const aggregate = aggregateReleaseRuns(environmentRuns);
+      return {
+        ...aggregate,
+        releaseId: existing.releaseId,
+        environmentId: environmentRuns[0]?.environmentId,
+        runNumber: existing.releaseName,
+        pipelineName: existing.releaseDefinitionName || config.releaseDefinitionName,
+        webUrl: environmentRuns[0]?.webUrl,
+        environmentRuns,
+        reusedRelease: true
+      };
+    }
+    // The auto-created release doesn't cover every requested environment; create one that does.
+  }
+
+  return createReleaseAndDeploy({
+    organization: config.organization,
+    project: config.project,
+    releaseDefinitionId: config.releaseDefinitionId,
+    artifactAlias: config.artifactAlias,
+    environmentDefinitionIds: environmentIds,
+    buildId,
+    buildNumber,
+    sourceBranch,
+    sourceVersion,
+    token
+  });
 }
 
 // Repos disagree on branch naming (develop/main/migration-v3/master), so rather than maintain an
@@ -979,7 +1192,10 @@ app.post('/api/services/:id/refresh', async (req, res) => {
   if (!svc) return res.status(404).json({ error: 'not found' });
 
   const token = (req.body && req.body.token) || '';
-  if (!svc.pipelineUrl) {
+  // While a shared mono-repo build is in flight the row has no URL of its own — poll the block's
+  // build instead, which is what decides when this row's release can be created.
+  const pollUrl = svc.pipelineUrl || svc.queueOperation?.buildWebUrl || '';
+  if (!pollUrl) {
     return res.status(400).json({ error: 'No pipeline URL set for this service yet.' });
   }
   if (!token) {
@@ -987,7 +1203,7 @@ app.post('/api/services/:id/refresh', async (req, res) => {
   }
 
   try {
-    const parsed = parsePipelineUrl(svc.pipelineUrl);
+    const parsed = parsePipelineUrl(pollUrl);
     let refreshedReleaseEnvironments = null;
     let result;
     if (
@@ -1013,7 +1229,9 @@ app.post('/api/services/:id/refresh', async (req, res) => {
       result = await fetchRunStatus({ ...parsed, token });
     }
     const config = store.getQueueConfig(svc.id);
-    let patch = getRunPatchFromResult(result);
+    const pollingSharedBuild = config?.type === 'build-release' && parsed.type === 'build';
+    // Only the block tracks the shared build, so don't stamp its name/number onto the row.
+    let patch = pollingSharedBuild ? { lastChecked: new Date().toISOString() } : getRunPatchFromResult(result);
 
     if (svc.queueOperation && parsed.type === 'build') {
       patch.queueOperation = {
@@ -1040,20 +1258,20 @@ app.post('/api/services/:id/refresh', async (req, res) => {
     if (
       parsed.type === 'build' &&
       result.status === 'succeeded' &&
-      svc.queueOperation?.phase === 'build' &&
+      // Retry release creation on the next refresh if it failed last time — the build stays put,
+      // so there's nothing else that would ever move this row out of a stuck error state.
+      (svc.queueOperation?.phase === 'build' || svc.queueOperation?.phase === 'release-error') &&
       config?.type === 'build-release'
     ) {
       store.updateService(svc.id, {
         queueOperation: { ...svc.queueOperation, phase: 'creating-release' }
       }, deploymentId, { markDirty: false });
-      const release = await createReleaseAndDeploy({
-        organization: config.organization,
-        project: config.project,
-        releaseDefinitionId: config.releaseDefinitionId,
-        artifactAlias: config.artifactAlias,
-        environmentDefinitionIds: svc.queueOperation.environmentDefinitionIds || [
-          svc.queueOperation.environmentDefinitionId
-        ],
+      const environmentIds = svc.queueOperation.environmentDefinitionIds || [
+        svc.queueOperation.environmentDefinitionId
+      ];
+      const release = await deployOrCreateReleaseForBuild({
+        config,
+        environmentIds,
         buildId: result.buildId,
         buildNumber: result.runNumber,
         sourceBranch: result.sourceBranch || svc.queueOperation.sourceBranch,
@@ -1080,7 +1298,8 @@ app.post('/api/services/:id/refresh', async (req, res) => {
           releaseEnvironments: release.environmentRuns,
           releaseStatus: release.status,
           releaseMessage: release.message,
-          releaseWebUrl: release.webUrl
+          releaseWebUrl: release.webUrl,
+          releaseReused: release.reusedRelease === true
         }
       };
     }
