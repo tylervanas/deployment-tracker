@@ -374,6 +374,7 @@ app.post('/api/preview', async (req, res) => {
   if (!token) return res.status(400).json({ error: 'Azure DevOps PAT is required.' });
 
   const services = currentState.groups.find((group) => group.name === scope)?.services || [];
+  const branchCache = new Map();
   const steps = await Promise.all(services.map(async (service) => {
     const config = store.getQueueConfig(service.id);
     if (!config) {
@@ -487,6 +488,17 @@ app.post('/api/preview', async (req, res) => {
 
       const branch = resolveBranch(config, selectedBranch);
       const buildUrl = `https://dev.azure.com/${config.organization}/${config.project}/_build?definitionId=${config.buildDefinitionId}`;
+
+      if (!(await branchExistsForConfig(config, branch, token, branchCache))) {
+        return {
+          service: service.name,
+          action: 'skip',
+          reason: `Branch "${branch}" was not found in this repository.`,
+          environments,
+          pipelineUrl: buildUrl
+        };
+      }
+
       if (config.type === 'build-release' && !forceNewBuilds.includes(String(config.buildDefinitionId))) {
         const release = await findLatestReleaseForBranch({
           organization: config.organization,
@@ -589,6 +601,8 @@ app.post('/api/queue-all', async (req, res) => {
   if (!plans.length) return res.status(400).json({ error: `No ${scope} services are configured for queueing yet.` });
 
   const applicablePlans = [];
+  const skipped = [];
+  const branchCache = new Map();
   for (const plan of plans) {
     plan.target = resolveQueueTarget(plan.config, lifecycle, region, scope);
     if (plan.target?.applicable === false) continue;
@@ -599,6 +613,16 @@ app.post('/api/queue-all', async (req, res) => {
     }
     plan.branch = resolveBranch(plan.config, selectedBranch);
     plan.forceNewBuild = forceNewBuilds.includes(String(plan.config.buildDefinitionId));
+
+    if (!(await branchExistsForConfig(plan.config, plan.branch, token, branchCache))) {
+      skipped.push({
+        id: plan.service.id,
+        name: plan.service.name,
+        reason: `Branch "${plan.branch}" was not found in this repository.`
+      });
+      continue;
+    }
+
     if (plan.config.type === 'package-release') {
       const requestedVersion = packageVersion || plan.config.defaultPackageVersion;
       if (!requestedVersion) {
@@ -707,6 +731,7 @@ app.post('/api/queue-all', async (req, res) => {
       lifecycle,
       region: scope === 'Regional' && lifecycle === 'Production' ? region : null,
       queuedServices,
+      skipped,
       buildsQueued: buildGroups.size,
       buildsReused: reusePlans.length,
       releasesCreated: applicablePlans.filter((plan) => plan.config.type === 'package-release').length,
@@ -840,6 +865,60 @@ async function deployLatestRelease({ config, target, branch, token }) {
   }
   return { patch: latestReleasePatch(release, runs, config, target), release };
 }
+
+// Repos disagree on branch naming (develop/main/migration-v3/master), so rather than maintain an
+// alias table we check each pipeline's own repo and let the caller skip it when the branch is
+// absent there. Results are cached per definition for the lifetime of one request.
+async function branchExistsForConfig(config, branch, token, cache) {
+  if (!config.buildDefinitionId) return true;
+  const key = `${config.organization}/${config.project}/${config.buildDefinitionId}`;
+  if (!cache.has(key)) {
+    cache.set(
+      key,
+      fetchDefinitionBranches({
+        organization: config.organization,
+        project: config.project,
+        definitionId: config.buildDefinitionId,
+        token
+      }).catch(() => null)
+    );
+  }
+  const branches = await cache.get(key);
+  // Fail open: an API hiccup shouldn't hide a service that would otherwise queue fine.
+  if (!branches) return true;
+  return branches.some((name) => name.toLowerCase() === branch.toLowerCase());
+}
+
+app.post('/api/scope-branches', async (req, res) => {
+  const { scope, token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'Azure DevOps PAT is required.' });
+  const services = store.getState().groups.find((group) => group.name === scope)?.services || [];
+  const configs = services
+    .map((service) => store.getQueueConfig(service.id))
+    .filter((config) => config?.buildDefinitionId);
+
+  const seen = new Set();
+  const uniqueConfigs = configs.filter((config) => {
+    const key = `${config.organization}/${config.project}/${config.buildDefinitionId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const perRepo = await Promise.all(uniqueConfigs.map((config) =>
+    fetchDefinitionBranches({
+      organization: config.organization,
+      project: config.project,
+      definitionId: config.buildDefinitionId,
+      token
+    }).catch(() => [])
+  ));
+
+  const defaults = [...new Set(configs.map((config) =>
+    config.defaultBranch?.replace(/^refs\/heads\//, '')).filter(Boolean))];
+  const branches = [...new Set([...defaults, ...perRepo.flat()])].sort((a, b) => a.localeCompare(b));
+  res.json({ branches, repoCount: uniqueConfigs.length });
+});
 
 app.post('/api/services/:id/correct-pipeline', (req, res) => {
   const deploymentId = store.getState().deployment.id;

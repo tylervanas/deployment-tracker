@@ -240,21 +240,25 @@ function renderQueueControls() {
   if (regionSelect) regionSelect.disabled = lifecycle !== 'Production';
 
   for (const scope of ['Regional', 'Global']) {
-    const branchSelect = document.getElementById(`queue-${scope.toLowerCase()}-branch`);
+    const branchInput = document.getElementById(`queue-${scope.toLowerCase()}-branch`);
+    const datalist = document.getElementById(`queue-${scope.toLowerCase()}-branches`);
     const firstConfig = configuredServices(scope)[0]?.config;
     const key = `${scope.toLowerCase()}Branch`;
-    if (!branchSelect) continue;
-    const current = queueSelections[key] || firstConfig?.defaultBranch?.replace(/^refs\/heads\//, '') || '';
-    const all = branchOptions[scope].length ? branchOptions[scope] : [current].filter(Boolean);
+    if (!branchInput) continue;
+    if (!queueSelections[key]) {
+      queueSelections[key] = firstConfig?.defaultBranch?.replace(/^refs\/heads\//, '') || '';
+    }
+    const all = branchOptions[scope].length ? branchOptions[scope] : [queueSelections[key]].filter(Boolean);
     const release = all.filter((branch) => /^release\//i.test(branch));
     const others = all.filter((branch) => !/^release\//i.test(branch));
-    const option = (branch) =>
-      `<option value="${escapeHtml(branch)}" ${branch === current ? 'selected' : ''}>${escapeHtml(branch)}</option>`;
-    branchSelect.innerHTML = release.length
-      ? `<optgroup label="Release branches">${release.map(option).join('')}</optgroup>` +
-        `<optgroup label="All branches">${others.map(option).join('')}</optgroup>`
-      : all.map(option).join('');
-    if (all.includes(current)) branchSelect.value = current;
+    if (datalist) {
+      datalist.innerHTML = [...release, ...others]
+        .map((branch) => `<option value="${escapeHtml(branch)}"></option>`).join('');
+    }
+    // Never stomp what the user is actively typing.
+    if (document.activeElement !== branchInput) {
+      branchInput.value = queueSelections[key];
+    }
   }
 
   const packageConfig = configuredServices('Global Widget')[0]?.config;
@@ -385,15 +389,16 @@ function renderGroups() {
   });
   document.getElementById('queue-regional-btn')?.addEventListener('click', () => queueScope('Regional'));
   document.getElementById('queue-regional-preview')?.addEventListener('click', () => previewScope('Regional'));
-  document.getElementById('queue-global-preview')?.addEventListener('click', () => previewScope('Global'));  document.getElementById('queue-global-btn')?.addEventListener('click', () => queueScope('Global'));
+  document.getElementById('queue-global-preview')?.addEventListener('click', () => previewScope('Global'));
+  document.getElementById('queue-global-btn')?.addEventListener('click', () => queueScope('Global'));
   document.getElementById('queue-widget-btn')?.addEventListener('click', () => {
     const widget = state.groups.find((group) => group.name === 'Global Widget')?.services[0];
     if (widget) queueService(widget.id);
   });
-  document.getElementById('queue-regional-branch')?.addEventListener('change', (event) => {
+  document.getElementById('queue-regional-branch')?.addEventListener('input', (event) => {
     queueSelections.regionalBranch = event.target.value;
   });
-  document.getElementById('queue-global-branch')?.addEventListener('change', (event) => {
+  document.getElementById('queue-global-branch')?.addEventListener('input', (event) => {
     queueSelections.globalBranch = event.target.value;
   });
   document.getElementById('queue-regional-region')?.addEventListener('change', (event) => {
@@ -526,7 +531,8 @@ function renderGroupQueueControls(groupName) {
   if (groupName === 'Regional') {
     return `
       <label for="queue-regional-branch">Branch</label>
-      <select id="queue-regional-branch"></select>
+      <input id="queue-regional-branch" type="text" list="queue-regional-branches" placeholder="branch name" autocomplete="off" />
+      <datalist id="queue-regional-branches"></datalist>
       <label for="queue-regional-region">Production region</label>
       <select id="queue-regional-region" ${queueLifecycleSelect.value === 'Production' ? '' : 'disabled'}>
         <option value="NA" selected>NA</option><option value="EMEA">EMEA</option><option value="APAC">APAC</option>
@@ -543,7 +549,8 @@ function renderGroupQueueControls(groupName) {
   if (groupName === 'Global') {
     return `
       <label for="queue-global-branch">Branch</label>
-      <select id="queue-global-branch"></select>
+      <input id="queue-global-branch" type="text" list="queue-global-branches" placeholder="branch name" autocomplete="off" />
+      <datalist id="queue-global-branches"></datalist>
       <button id="queue-global-preview" class="btn btn-secondary">Dry run</button>
       <button id="queue-global-btn" class="btn btn-primary">Queue all Global</button>`;
   }
@@ -682,21 +689,18 @@ async function loadQueueBranches() {
   if (!getToken()) return;
   for (const scope of ['Regional', 'Global']) {
     if (loadedBranchScopes.has(scope)) continue;
-    const services = configuredServices(scope);
-    const configuredId = services[0]?.service.id;
-    const defaults = [...new Set(services
-      .map(({ config }) => config.defaultBranch?.replace(/^refs\/heads\//, ''))
-      .filter(Boolean))];
-    if (!configuredId) continue;
+    if (!configuredServices(scope).length) continue;
     try {
-      const branches = await api(`/services/${configuredId}/branches`, {
+      const result = await api('/scope-branches', {
         method: 'POST',
-        body: JSON.stringify({ token: getToken() })
+        body: JSON.stringify({ scope, token: getToken() })
       });
-      branchOptions[scope] = [...new Set([...defaults, ...branches])].sort((a, b) => a.localeCompare(b));
+      branchOptions[scope] = result.branches || [];
       loadedBranchScopes.add(scope);
     } catch {
-      branchOptions[scope] = defaults;
+      branchOptions[scope] = [...new Set(configuredServices(scope)
+        .map(({ config }) => config.defaultBranch?.replace(/^refs\/heads\//, ''))
+        .filter(Boolean))];
     }
     renderQueueControls();
   }
@@ -907,6 +911,12 @@ async function queueScope(scope) {
       })
     });
     state = result.state;
+    if (result.skipped?.length) {
+      alert(
+        `${result.skipped.length} service(s) were skipped for branch "${selected.branch}":\n\n` +
+        result.skipped.map((item) => `• ${item.name}: ${item.reason}`).join('\n')
+      );
+    }
   } finally {
     queueAllInProgress = false;
     render();
@@ -1502,15 +1512,13 @@ function renderWizard() {
       : [wizard.branches[step.scope]].filter(Boolean);
     const release = all.filter((branch) => /^release\//i.test(branch));
     const others = all.filter((branch) => !/^release\//i.test(branch));
-    const option = (branch) =>
-      `<option value="${escapeHtml(branch)}" ${branch === wizard.branches[step.scope] ? 'selected' : ''}>${
-        escapeHtml(branch)}</option>`;
     body.innerHTML = `<h3>Which release branch for ${escapeHtml(SCOPE_LABELS[step.scope])}?</h3>
-      <p class="wizard-help">This is the release train you are shipping.</p>
-      <select id="wizard-branch">${release.length
-        ? `<optgroup label="Release branches">${release.map(option).join('')}</optgroup>` +
-          `<optgroup label="All branches">${others.map(option).join('')}</optgroup>`
-        : all.map(option).join('')}</select>`;
+      <p class="wizard-help">This is the release train you are shipping. Not every pipeline in this
+        group uses the same branch names \u2014 type what you believe is correct and the dry run will
+        tell you if any pipeline should be skipped.</p>
+      <input id="wizard-branch" type="text" list="wizard-branches" autocomplete="off" value="${escapeHtml(wizard.branches[step.scope])}" />
+      <datalist id="wizard-branches">${[...release, ...others]
+        .map((branch) => `<option value="${escapeHtml(branch)}"></option>`).join('')}</datalist>`;
   } else if (step.id === 'freshCode') {
     body.innerHTML = `<h3>Has new code been merged for ${escapeHtml(SCOPE_LABELS[step.scope])}?</h3>
       <p class="wizard-help">If nothing has changed since the last release was built, we reuse it. That is the normal case.</p>
