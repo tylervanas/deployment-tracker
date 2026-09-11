@@ -59,6 +59,61 @@ test('fetches a Build definition name from Azure DevOps', async () => {
   }
 });
 
+test('reports a running build as awaiting approval when a stage is gated', async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async (url) => {
+    const body = url.includes('/timeline')
+      ? {
+          records: [
+            { id: 'stage-1', parentId: null, type: 'Stage', name: 'Deploy Demo CUS', state: 'pending' },
+            { id: 'check-1', parentId: 'stage-1', type: 'Checkpoint', name: 'Checkpoint', state: 'inProgress' },
+            { id: 'appr-1', parentId: 'check-1', type: 'Checkpoint.Approval', name: 'Checkpoint.Approval', state: 'inProgress' },
+            { id: 'stage-0', parentId: null, type: 'Stage', name: 'BuildAndTest', state: 'completed' }
+          ]
+        }
+      : { id: 903776, status: 'inProgress', buildNumber: '20260911.1', definition: { name: 'Yarp API' } };
+    return { ok: true, status: 200, statusText: 'OK', json: async () => body };
+  };
+
+  try {
+    const result = await fetchBuildStatus({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      buildId: '903776',
+      token: 'test-token'
+    });
+    assert.equal(result.status, 'awaitingApproval');
+    assert.match(result.message, /Deploy Demo CUS/);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('does not look up the timeline for a build that already finished', async () => {
+  const originalFetch = global.fetch;
+  const urls = [];
+  global.fetch = async (url) => {
+    urls.push(url);
+    return {
+      ok: true, status: 200, statusText: 'OK',
+      json: async () => ({ id: 903776, status: 'completed', result: 'succeeded', buildNumber: '20260911.1' })
+    };
+  };
+
+  try {
+    const result = await fetchBuildStatus({
+      organization: 'mrisoftware',
+      project: 'MRI_Platform',
+      buildId: '903776',
+      token: 'test-token'
+    });
+    assert.equal(result.status, 'succeeded');
+    assert.equal(urls.filter((url) => url.includes('/timeline')).length, 0);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('fetches a classic Release definition name from Azure DevOps', async () => {
   const originalFetch = global.fetch;
   global.fetch = mockFetch(
